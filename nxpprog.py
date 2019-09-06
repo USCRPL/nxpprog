@@ -28,11 +28,17 @@ import os
 import sys
 import struct
 import getopt
-import serial # pyserial
+import serial
 import socket
 import time
 
-import ihex
+# debugging config
+
+# If true, echo from the chip will be turned on and checked against the sent string.
+ENABLE_ECHO = False
+
+# If true, print all transmitted and received serial messages to the console
+PRINT_SERIAL = True
 
 CMD_SUCCESS = 0
 INVALID_COMMAND = 1
@@ -381,8 +387,8 @@ cpu_parms = {
 
 
 def log(str):
-    sys.stderr.write("%s\n" % str)
-    sys.stderr.flush()
+    sys.stdout.write("%s\n" % str)
+    sys.stdout.flush()
 
 
 def dump(name, str):
@@ -398,7 +404,7 @@ def dump(name, str):
 
 
 def panic(str):
-    log(str)
+    log("PANIC: " + str)
     sys.exit(1)
 
 
@@ -424,7 +430,6 @@ options:
     --eraseonly : don't program, just erase. Implies --eraseall.
     --eraseall : erase all flash not just the area written to.
     --blankcheck : don't program, just check that the flash is blank.
-    --filetype=[ihex|bin] : set filetype to intel hex format or raw binary.
     --bank=[0|1] : select bank for devices with flash banks.
     --port=<udp port> : UDP port number to use (default 41825).
     --mac=<mac address> : MAC address to associate IP address with.\
@@ -433,30 +438,35 @@ options:
 class SerialDevice(object):
     def __init__(self, device, baud, xonxoff=False, control=False):
         # Create the Serial object without port to avoid automatic opening
-        self._serial = serial.Serial(port=None, baudrate=baud)
+        self._serial = serial.Serial(port=None, baudrate=baud, stopbits=serial.STOPBITS_ONE)
 
         # Disable RTS and DRT to avoid automatic reset to ISP mode (use --control for explicit reset)
-        self._serial.setRTS(0)
-        self._serial.setDTR(0)
+        self._serial.setRTS(1)
+        self._serial.setDTR(1)
 
         # Select and open the port after RTS and DTR are set to zero
+        print("Opening device...")
         self._serial.setPort(device)
         self._serial.open()
 
-        # set a two second timeout just in case there is nothing connected
+        # set a timeout just in case there is nothing connected
         # or the device is in the wrong mode.
         # This timeout is too short for slow baud rates but who wants to
         # use them?
-        self._serial.setTimeout(5)
+        self._serial.timeout = .2
         # device wants Xon Xoff flow control
         if xonxoff:
-            self._serial.setXonXoff(1)
+            self._serial.xonxoff = True
 
         # reset pin is controlled by DTR implying int0 is controlled by RTS
         self.reset_pin = "dtr"
 
         if control:
+            print("Resetting chip...")
             self.isp_mode()
+            print("Reset complete.")
+
+            time.sleep(.1)
 
         self._serial.flushInput()
 
@@ -466,9 +476,9 @@ class SerialDevice(object):
     def isp_mode(self):
         self.reset(0)
         time.sleep(.1)
-        self.reset(1)
         self.int0(1)
-        time.sleep(.1)
+        self.reset(1)
+        time.sleep(.5)
         self.reset(0)
         time.sleep(.1)
         self.int0(0)
@@ -489,15 +499,17 @@ class SerialDevice(object):
     def write(self, data):
         self._serial.write(data)
 
-    def readline(self, timeout=None):
-        if timeout:
-            ot = self._serial.getTimeout()
-            self._serial.setTimeout(timeout)
+    def readline(self, timeout_allowed:bool=False):
 
         line = b''
         while True:
             c = self._serial.read(1)
             if not c:
+
+                if not timeout_allowed:
+                    print("Timeout after receiving %d characters" % len(line))
+                    print("Line so far: %s" % line.hex())
+
                 break
             if c == b'\r':
                 if not line:
@@ -511,10 +523,9 @@ class SerialDevice(object):
                     break
             line += c
 
-        if timeout:
-            self._serial.setTimeout(ot)
+        #print("Line (%d chars): %s" % (len(line), line.hex()))
 
-        return line.decode("UTF-8", "ignore")
+        return line.decode("ASCII", "ignore")
 
 class UdpDevice(object):
     def __init__(self, address):
@@ -590,7 +601,7 @@ class nxpprog:
         else:
             self.sector_commands_need_bank = True
 
-    def connection_init(self, osc_freq):
+    def connection_init(self, osc_freq:int):
         self.sync(osc_freq)
 
         if self.cpu == "autodetect":
@@ -619,17 +630,31 @@ class nxpprog:
         self.isp_command("U 23130")
 
 
+    # this version takes a bytes argument,
+    # and does not send a newline
     def dev_write(self, data):
+
+        if PRINT_SERIAL:
+            print('<- ' + data.decode("utf-8"))
+
         self.device.write(data)
 
+    # this version takes a str argument, and
+    # appends a newline.
     def dev_writeln(self, data):
-        data = data.encode('UTF-8') + b'\r\n'
-        # print('> ' + data)
-        self.device.write(data)
+        data_bytes = data.encode('UTF-8') + b'\r\n'
 
-    def dev_readline(self, timeout=None):
-        data = self.device.readline(timeout)
-        # print('< ' + data)
+        if PRINT_SERIAL:
+            print('<- ' + data)
+
+        self.device.write(data_bytes)
+
+    def dev_readline(self, timeout_allowed:bool = False):
+        data = self.device.readline(timeout_allowed)
+
+        if PRINT_SERIAL:
+            print('-> ' + data)
+
         return data
 
     def errexit(self, str, status):
@@ -664,8 +689,19 @@ class nxpprog:
             panic("%s: %d - %s" % (str, err, errstr))
 
 
-    def isp_command(self, cmd):
-        retry = 3
+    # Send a command string (without a newline) to the chip.
+    # If an error code is returned, the command is retried,
+    # except if the error code is in allowed_error_codes
+    def isp_command(self, cmd, allowed_error_codes=()):
+
+        # turn the codes into strings
+        allowed_result_strings = set()
+
+        for code in allowed_error_codes:
+            allowed_result_strings.add(str(code))
+
+        retry = 5
+        status = None
         while retry > 0:
             retry -= 1
             self.dev_writeln(cmd)
@@ -674,11 +710,14 @@ class nxpprog:
             if self.echo_on:
                 echo = self.dev_readline()
                 if self.verify and echo != cmd:
-                    log('Invalid echo')
+                    log('Invalid echo -- retrying command')
+                    self.dev_readline() # remove status code
+                    continue
 
             status = self.dev_readline()
-            if status:
-                break
+            if status == "0" or status in allowed_result_strings:
+                return status
+
         self.errexit("'%s' error" % cmd, status)
 
         return status
@@ -686,32 +725,25 @@ class nxpprog:
 
     def sync(self, osc):
         self.dev_write(b'?')
-        s = self.dev_readline()
-        if not s:
-            panic("Sync timeout")
-        if s != self.sync_str:
-            panic("No sync string")
+        self.dev_readline()
 
         self.dev_writeln(self.sync_str)
         s = self.dev_readline()
+        self.dev_readline()
 
         # detect echo state
         if s == self.sync_str:
             self.echo_on = True
-            s = self.dev_readline()
         elif s == self.OK:
             self.echo_on = False
         else:
             panic("No sync string")
 
-        if s != self.OK:
-            panic("Not ok")
-
         # set the oscillator frequency
         self.dev_writeln('%d' % osc)
         if self.echo_on:
             s = self.dev_readline()
-            if s != ('%d' % osc):
+            if not ('%d' % osc) in s:
                 panic('Invalid echo')
 
         s = self.dev_readline()
@@ -719,24 +751,25 @@ class nxpprog:
             if s == str(INVALID_COMMAND):
                 pass
             else:
-                self.errexit("'%d' osc not ok" % osc, s)
+                self.errexit(("'%d' osc not ok" % osc), None)
                 panic("Osc not ok")
 
-        # disable echo
-        self.dev_writeln('A 0')
-        if self.echo_on:
-            s = self.dev_readline()
-            if s != 'A 0':
-                panic('Invalid echo')
+        if not ENABLE_ECHO:
+            # disable echo
+            self.dev_writeln('A 0')
+            if self.echo_on:
+                s = self.dev_readline()
+                if s != 'A 0':
+                    panic('Invalid echo')
 
-        s = self.dev_readline()
-        if s == str(CMD_SUCCESS):
-            self.echo_on = False
-        elif s == str(INVALID_COMMAND):
-            pass
-        else:
-            self.errexit("'A 0' echo disable failed", s)
-            panic("Echo disable failed")
+            s = self.dev_readline()
+            if s == str(CMD_SUCCESS):
+                self.echo_on = False
+            elif s == str(INVALID_COMMAND):
+                pass
+            else:
+                self.errexit("'A 0' echo disable failed", s)
+                panic("Echo disable failed")
 
 
     def sum(self, data):
@@ -758,16 +791,38 @@ class nxpprog:
             if c_line_size > self.uu_line_size:
                 c_line_size = self.uu_line_size
             block = data[i:i+c_line_size]
-            bstr = binascii.b2a_uu(block)
-            self.dev_write(bstr)
+            bstr = binascii.b2a_uu(block).decode("UTF-8")[0:-1]
+            self.dev_writeln(bstr)
+
+            if self.echo_on:
+                echo = self.dev_readline()
+                if echo != bstr:
+                    log("Invalid echo from RAM block")
+
+                    # sometimes the echo could be invalid because a newline was erroneously inserted.
+                    # In this case, clear out any remaining lines in the buffer to fix things.
+                    self.device._serial.flushInput()
 
         retry = 3
+
+        status = None
+
         while retry > 0:
             retry -= 1
-            self.dev_writeln('%s' % self.sum(data))
+
+            checksum_str = '%s' % self.sum(data)
+            self.dev_writeln(checksum_str)
+
+            if self.echo_on:
+                echo = self.dev_readline()
+                if echo != checksum_str:
+                    log("Invalid echo from RAM block checksum")
+                    continue
+
             status = self.dev_readline()
-            if status:
+            if status == self.OK or status == self.RESEND:
                 break
+
         if not status:
             return "timeout"
         if status == self.RESEND:
@@ -776,7 +831,7 @@ class nxpprog:
             return ""
 
         # unknown status result
-        panic(status)
+        panic("Unknown status from writing RAM block: " + status)
 
     def uudecode(self, line):
         # uu encoded data has an encoded length first
@@ -852,8 +907,8 @@ class nxpprog:
 
             self.isp_command("W %d %d" % ( addr, a_block_size ))
 
-            retry = 3
-            while retry > 0:
+            retry = 10
+            while retry >= 0:
                 retry -= 1
                 err = self.write_ram_block(addr, data[i : i + a_block_size])
                 if not err:
@@ -861,7 +916,7 @@ class nxpprog:
                 elif err != "resend":
                     panic("Write error: %s" % err)
                 else:
-                    log("Resending")
+                    log("Resending -- %d Attempts Left" % retry)
 
             addr += a_block_size
 
@@ -952,14 +1007,14 @@ class nxpprog:
                 cmd = ("I %d %d 0" % (i, i))
             else:
                 cmd = ("I %d %d" % (i, i))
-            result = self.isp_command(cmd)
+            result = self.isp_command(cmd, (SECTOR_NOT_BLANK,))
             if result == str(CMD_SUCCESS):
                 pass
             elif result == str(SECTOR_NOT_BLANK):
                 self.dev_readline() # offset
                 self.dev_readline() # content
             else:
-                self.errexit("'%s' error" % cmd, status)
+                self.errexit("'%s' error" % cmd, result)
         panic = old_panic
 
 
@@ -1061,15 +1116,16 @@ class nxpprog:
                 old_panic = panic
                 panic = log
                 result = self.isp_command("M %d %d %d" %
-                                          (flash_addr_start, ram_addr, a_ram_block))
+                                          (flash_addr_start, ram_addr, a_ram_block), (COMPARE_ERROR,))
                 panic = old_panic
                 if result == str(CMD_SUCCESS):
                     pass
                 elif result == str(COMPARE_ERROR):
-                    self.dev_readline() # offset
+                    offset = self.dev_readline() # offset
+                    print("Compare error between RAM and flash! Offset of first difference in sector: %s" % (offset, ))
                     success = False
                 else:
-                    self.errexit("'%s' error" % cmd, status)
+                    self.errexit("Error during verify", result)
 
         return success
 
@@ -1111,9 +1167,8 @@ class nxpprog:
 
             for (i, (x, y)) in enumerate(zip(data, image[index:index+(end-start)])):
                 if x != y:
-                    log("Verify failed! content differ at location 0x%x" % (faddr + i))
+                    log("Verify failed! content differ at location 0x%x. Expected: 0x%x, got: 0x%x" % (faddr + i, y, x))
                     success = False
-                    break
 
             index = index + length
             sector = sector + 1
@@ -1148,7 +1203,7 @@ class nxpprog:
         id1 = self.dev_readline()
 
         # FIXME find a way of doing this without a timeout
-        id2 = self.dev_readline(.2)
+        id2 = self.dev_readline(True)
         if id2:
             ret = (int(id1), int(id2))
         else:
@@ -1159,9 +1214,9 @@ class nxpprog:
     def get_serial_number(self):
         self.isp_command("N")
         id1 = self.dev_readline()
-        id2 = self.dev_readline(.2)
-        id3 = self.dev_readline(.2)
-        id4 = self.dev_readline(.2)
+        id2 = self.dev_readline()
+        id3 = self.dev_readline()
+        id4 = self.dev_readline()
         return ' '.join([id1, id2, id3, id4])
 
 
@@ -1182,7 +1237,6 @@ def main(argv=None):
     xonxoff = False
     start = False
     control = False
-    filetype = "autodetect"
     select_bank = False
     read = False
     readlen = 0
@@ -1227,10 +1281,6 @@ def main(argv=None):
             blank_check = True
         elif o == "--control":
             control = True
-        elif o == "--filetype":
-            filetype = a
-            if not ( filetype == "bin" or filetype == "ihex" ):
-                panic("Invalid filetype: %s" % filetype)
         elif o == "--start":
             start = True
             if a:
@@ -1256,7 +1306,7 @@ def main(argv=None):
         else:
             panic("Unhandled option: %s" % o)
 
-    if cpu != "autodetect" and not cpu_parms.has_key(cpu):
+    if cpu != "autodetect" and not cpu in cpu_parms:
         panic("Unsupported cpu %s" % cpu)
 
     if len(args) == 0:
@@ -1318,14 +1368,7 @@ def main(argv=None):
 
         filename = args[1]
 
-        if filetype == "autodetect":
-            filetype = "ihex" if filename.endswith('hex') else "bin"
-
-        if filetype == "ihex":
-            ih = ihex.ihex(filename)
-            (flash_addr_base, image) = ih.flatten()
-        else:
-            image = open(filename, "rb").read()
+        image = open(filename, "rb").read()
 
         if not verify_only:
             start = time.time()
